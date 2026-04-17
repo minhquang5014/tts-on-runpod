@@ -18,14 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ── PyTorch with CUDA 12.1 ────────────────────────────────────────────────────
-# Installed separately so Docker can cache this large layer independently.
-RUN pip install --no-cache-dir \
+# Use python3 -m pip to guarantee packages land in the same Python that runs
+# the handler — avoids "No module named X" when pip and python3 diverge.
+RUN python3 -m pip install --no-cache-dir \
     torch==2.3.1+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
 # ── App dependencies ──────────────────────────────────────────────────────────
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 # ── Bake model weights into the image ────────────────────────────────────────
 # Models are downloaded at build time so cold-start containers load from local
