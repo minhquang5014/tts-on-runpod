@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Bake model weights into the image ────────────────────────────────────────
 # Models are downloaded at build time so cold-start containers load from local
 # disk (~5–10 s) rather than re-downloading on every first request (~60 s).
-RUN python - <<'EOF'
+RUN python3 - <<'EOF'
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -53,4 +53,4 @@ EOF
 # ── Handler ───────────────────────────────────────────────────────────────────
 COPY handler.py .
 
-CMD ["python", "-u", "handler.py"]
+CMD ["python3", "-u", "handler.py"]
