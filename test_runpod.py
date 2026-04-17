@@ -16,9 +16,9 @@ Env vars (set in .env or shell):
 
 import argparse
 import base64
-import io
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -53,9 +53,10 @@ _load_env(os.path.join(os.path.dirname(__file__), ".env"))
 DEFAULT_API_KEY     = os.environ.get("RUNPOD_API_KEY",     "")
 DEFAULT_ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "")
 DEFAULT_SCALE       = 1.2
-REQUEST_TIMEOUT     = 120   # RunPod sync jobs can take up to 90 s on cold start
+REQUEST_TIMEOUT     = 300   # cold start: container boot + 3 model loads ≈ 90–120s
 
-RUNSYNC_URL = "https://api.runpod.io/v2/{endpoint_id}/runsync"
+RUN_URL    = "https://api.runpod.ai/v2/{endpoint_id}/run"
+STATUS_URL = "https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
 
 
 # ── Audio playback ────────────────────────────────────────────────────────────
@@ -97,10 +98,9 @@ def request_tts(
     length_scale: float,
 ) -> tuple[bytes, dict]:
     """
-    POST to RunPod /runsync.
+    POST to RunPod /run (async), then poll /status until COMPLETED.
     Returns (mp3_bytes, timing_dict).
     """
-    url     = RUNSYNC_URL.format(endpoint_id=endpoint_id)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
@@ -109,19 +109,38 @@ def request_tts(
 
     t0 = time.perf_counter()
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    # Submit job
+    run_resp = requests.post(
+        RUN_URL.format(endpoint_id=endpoint_id),
+        json=payload, headers=headers, timeout=30,
+    )
+    run_resp.raise_for_status()
+    job_id = run_resp.json().get("id")
+    if not job_id:
+        raise RuntimeError(f"No job ID in response: {run_resp.text}")
 
-    t_response = time.perf_counter()
-    resp.raise_for_status()
+    print(f"     job={job_id}  polling", end="", flush=True)
 
-    body = resp.json()
-    t_parsed = time.perf_counter()
+    # Poll until done
+    status_url = STATUS_URL.format(endpoint_id=endpoint_id, job_id=job_id)
+    body = {}
+    while True:
+        time.sleep(2)
+        print(".", end="", flush=True)
+        sr = requests.get(status_url, headers=headers, timeout=30)
+        sr.raise_for_status()
+        body = sr.json()
+        status = body.get("status", "")
+        if status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+            break
+        if (time.perf_counter() - t0) > REQUEST_TIMEOUT:
+            raise RuntimeError(f"Timed out after {REQUEST_TIMEOUT}s")
 
-    # RunPod wraps the handler output in {"status": "COMPLETED", "output": {...}}
-    status = body.get("status", "UNKNOWN")
-    if status != "COMPLETED":
-        error = body.get("error") or body.get("output", {}).get("error") or status
-        raise RuntimeError(f"RunPod job status={status}: {error}")
+    print()  # newline after dots
+    t_done = time.perf_counter()
+
+    if body.get("status") != "COMPLETED":
+        raise RuntimeError(f"Job {body.get('status')}: {body.get('error', '')}")
 
     output = body.get("output", {})
     if "error" in output:
@@ -131,19 +150,14 @@ def request_tts(
     if not audio_b64:
         raise RuntimeError("No audio in RunPod response")
 
-    mp3_bytes = base64.b64decode(audio_b64)
-    t_done    = time.perf_counter()
-
-    execution_ms = body.get("executionTime", 0)  # reported by RunPod (handler time only)
+    mp3_bytes    = base64.b64decode(audio_b64)
+    execution_ms = body.get("executionTime", 0)
 
     timing = {
-        "request_ms":   (t_response - t0)       * 1000,
-        "parse_ms":     (t_done - t_response)    * 1000,
-        "total_ms":     (t_done - t0)            * 1000,
-        "execution_ms": execution_ms,            # GPU inference time inside worker
+        "total_ms":     (t_done - t0) * 1000,
+        "execution_ms": execution_ms,
         "size_kb":      len(mp3_bytes) / 1024,
-        "status":       resp.status_code,
-        "runpod_id":    body.get("id", ""),
+        "runpod_id":    job_id,
     }
     return mp3_bytes, timing
 
@@ -152,30 +166,40 @@ def request_tts(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RunPod TTS latency tester")
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT_ID,
-                        help="RunPod endpoint ID (or set RUNPOD_ENDPOINT_ID)")
-    parser.add_argument("--key",      default=DEFAULT_API_KEY,
-                        help="RunPod API key (or set RUNPOD_API_KEY)")
-    parser.add_argument("--scale",    default=DEFAULT_SCALE, type=float,
+    parser.add_argument("--scale", default=DEFAULT_SCALE, type=float,
                         help="length_scale (1.0=normal, 1.2=slower, 0.8=faster)")
     args = parser.parse_args()
 
-    endpoint_id = args.endpoint.strip()
-    api_key     = args.key.strip()
+    # Endpoint and key come exclusively from .env / shell environment.
+    raw = DEFAULT_ENDPOINT_ID.strip()
+    m   = re.search(r"/v2/([^/]+)", raw)
+    endpoint_id = m.group(1) if m else raw
+    api_key     = DEFAULT_API_KEY.strip()
     scale       = args.scale
 
     if not endpoint_id:
-        print("ERROR: provide endpoint ID via --endpoint or RUNPOD_ENDPOINT_ID env var.")
+        print("ERROR: RUNPOD_ENDPOINT_ID not set in .env")
         sys.exit(1)
     if not api_key:
-        print("ERROR: provide API key via --key or RUNPOD_API_KEY env var.")
+        print("ERROR: RUNPOD_API_KEY not set in .env")
         sys.exit(1)
 
     print(f"\n-- RunPod TTS Latency Test --")
     print(f"   endpoint : {endpoint_id}")
     print(f"   auth     : {'set' if api_key else 'MISSING'}")
     print(f"   scale    : {scale}  (>1 = slower)")
-    print(f"   url      : {RUNSYNC_URL.format(endpoint_id=endpoint_id)}")
+    print(f"   url      : {RUN_URL.format(endpoint_id=endpoint_id)}")
+
+    # Health check — shows endpoint status and worker counts before first request.
+    health_url = f"https://api.runpod.ai/v2/{endpoint_id}/health"
+    try:
+        h = requests.get(health_url,
+                         headers={"Authorization": f"Bearer {api_key}"},
+                         timeout=10)
+        print(f"   health   : HTTP {h.status_code} — {h.text[:200]}")
+    except Exception as exc:
+        print(f"   health   : ERROR — {exc}")
+
     print("   Type 'q' or Ctrl-C to quit.\n")
 
     request_num = 0
@@ -208,8 +232,7 @@ def main() -> None:
         exec_note = (f"  gpu_inference={t['execution_ms']}ms" if t['execution_ms'] else "")
         print(
             f"[#{request_num}] OK  {t['size_kb']:.0f} KB  |  "
-            f"total={t['total_ms']:.0f}ms  "
-            f"(request={t['request_ms']:.0f}ms  decode={t['parse_ms']:.0f}ms)"
+            f"total={t['total_ms']:.0f}ms"
             f"{exec_note}  |  job={t['runpod_id'][:12]}…"
         )
         print(f"[#{request_num}] playing…\n")
