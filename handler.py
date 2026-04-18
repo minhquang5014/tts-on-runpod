@@ -22,9 +22,11 @@ Output:
 """
 
 import base64
+import concurrent.futures
 import io
 import re
 import sys
+import time
 
 import numpy as np
 import runpod
@@ -99,39 +101,49 @@ def segment(text: str) -> list[tuple[str, str]]:
     return spans
 
 
-# ── Load Kokoro for EN + ZH ───────────────────────────────────────────────────
+# ── Parallel model loading ────────────────────────────────────────────────────
+# Kokoro (CPU) and VITS (GPU) are independent — load both at the same time to
+# cut cold-start from ~60s (sequential) to ~30s (parallel).
 
-print("[tts] loading Kokoro pipelines (EN + ZH)…", flush=True)
 from kokoro import KPipeline  # noqa: E402
-
-KOKORO_PIPELINES: dict[str, KPipeline] = {}
-for _code, _label in (("a", "English"), ("z", "Chinese")):
-    try:
-        KOKORO_PIPELINES[_code] = KPipeline(lang_code=_code)
-        print(f"[tts]   Kokoro '{_code}' ({_label}) ready", flush=True)
-    except Exception as _exc:
-        print(f"[tts]   Kokoro '{_code}' failed: {_exc}", flush=True)
+import torch  # noqa: E402
+from transformers import AutoTokenizer, VitsModel  # noqa: E402
 
 _KOKORO_VOICES = {
     "en": "af_heart",     # American English — warm female voice
     "zh": "zf_xiaobei",   # Mandarin Chinese female
 }
 
-# ── Load MMS-TTS VITS for Vietnamese ─────────────────────────────────────────
 
-print("[tts] loading MMS-TTS VITS (Vietnamese)…", flush=True)
-import torch  # noqa: E402
-from transformers import AutoTokenizer, VitsModel  # noqa: E402
+def _load_kokoro() -> dict:
+    pipelines = {}
+    for code, label in (("a", "English"), ("z", "Chinese")):
+        try:
+            pipelines[code] = KPipeline(lang_code=code)
+            print(f"[tts]   Kokoro '{code}' ({label}) ready", flush=True)
+        except Exception as exc:
+            print(f"[tts]   Kokoro '{code}' failed: {exc}", flush=True)
+    return pipelines
 
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[tts]   device: {_DEVICE}", flush=True)
 
-VI_MODEL     = VitsModel.from_pretrained("facebook/mms-tts-vie").to(_DEVICE).eval()
-VI_TOKENIZER = AutoTokenizer.from_pretrained("facebook/mms-tts-vie")
-VI_SR        = VI_MODEL.config.sampling_rate   # 16 000 Hz
-print(f"[tts]   MMS-TTS Vietnamese ready  sr={VI_SR}", flush=True)
+def _load_vits() -> tuple:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[tts]   device: {device}", flush=True)
+    model     = VitsModel.from_pretrained("facebook/mms-tts-vie").to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-vie")
+    sr        = model.config.sampling_rate   # 16 000 Hz
+    print(f"[tts]   MMS-TTS Vietnamese ready  sr={sr}", flush=True)
+    return model, tokenizer, sr, device
 
-print(f"[tts] all models loaded — device={_DEVICE}", flush=True)
+
+print("[tts] loading all models in parallel…", flush=True)
+_t0 = time.perf_counter()
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _pool:
+    _kokoro_fut = _pool.submit(_load_kokoro)
+    _vits_fut   = _pool.submit(_load_vits)
+    KOKORO_PIPELINES                      = _kokoro_fut.result()
+    VI_MODEL, VI_TOKENIZER, VI_SR, _DEVICE = _vits_fut.result()
+print(f"[tts] all models loaded in {time.perf_counter() - _t0:.1f}s — device={_DEVICE}", flush=True)
 
 
 # ── Amplitude normalisation ───────────────────────────────────────────────────
